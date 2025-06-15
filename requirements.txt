@@ -1,4 +1,5 @@
-selenium==4.22.0
-python-dotenv==1.0.1
-ttkbootstrap==1.10.1
-SQLAlchemy==2.0.31
+selenium
+python-dotenv
+ttkbootstrap
+SQLAlchemy
+webdriver-manager
