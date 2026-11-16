@@ -7,6 +7,16 @@
 ### Database ###
 History.db
 
+### Logs ###
+logs/
+
+### Certificados y tickets de acceso de ARCA ###
+certificados/
+ta_*.json
+*.key
+*.csr
+*.crt
+
 ### Tests ###
 test.py
 

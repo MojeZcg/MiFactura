@@ -1,6 +1,4 @@
-"""
-Create a database 
-"""
+"""Base de datos local con el historial de facturas emitidas."""
 
 from datetime import datetime
 
@@ -15,132 +13,125 @@ from sqlalchemy import (
     String,
     create_engine,
 )
-from sqlalchemy.orm import declarative_base, relationship, sessionmaker
+from sqlalchemy.orm import declarative_base, joinedload, relationship, sessionmaker
 
-# Configurar la base de datos
-engine = create_engine('sqlite:///History.db', pool_size=20, max_overflow=10)
+from config import DB_PATH
+
+engine = create_engine(f"sqlite:///{DB_PATH.as_posix()}")
 Base = declarative_base()
+Session = sessionmaker(bind=engine, expire_on_commit=False)
+
+TIPOS_DE_DOCUMENTO = ("CUIL", "CUIT", "DNI")
+CONDICIONES_IVA = (
+    "Consumidor Final",
+    "Iva Responsable Inscripto",
+    "Iva Sujeto Exento",
+)
+
 
 class Meta(Base):
     # pylint: disable=too-few-public-methods
-    """
-    Clase para saber si se ha inicializado o no
-    """
-    __tablename__ = 'meta'
+    """Indica si la base de datos ya fue inicializada."""
+
+    __tablename__ = "meta"
     id = Column(Integer, primary_key=True)
     inicializado = Column(Boolean, default=False)
 
-# Definir el modelo para TiposDeDocumentos
+
 class TiposDeDocumentos(Base):
     # pylint: disable=too-few-public-methods
-    """
-    Clase para representar el modelo de TiposDeDocumentos.
-    """
-    __tablename__ = 'TiposDeDocumentos'
+    """Tipos de documento del cliente."""
+
+    __tablename__ = "TiposDeDocumentos"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     nombre_de_tipo = Column(String, nullable=False)
 
-# Definir el modelo para CondicionFrenteIva
+
 class CondicionFrenteIva(Base):
     # pylint: disable=too-few-public-methods
-    """
-    Clase para representar el modelo de CondicionFrenteIva.
-    """
-    __tablename__ = 'CondicionFrenteIva'
+    """Condiciones frente al IVA del cliente."""
+
+    __tablename__ = "CondicionFrenteIva"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     nombre_de_condicion = Column(String, nullable=False)
 
-# Definir el modelo para Facturas
+
 class Facturas(Base):
     # pylint: disable=too-few-public-methods
-    """
-    Clase para representar el modelo de Facturas.
-    """
-    __tablename__ = 'Facturas'
+    """Factura emitida."""
+
+    __tablename__ = "Facturas"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     id_cliente = Column(String, nullable=True)
     tipo_de_documento_id = Column(
-        String,
-        ForeignKey('TiposDeDocumentos.id'),
-        nullable=False
+        String, ForeignKey("TiposDeDocumentos.id"), nullable=False
     )
-    condicion_iva = Column(
-        String,
-        ForeignKey('CondicionFrenteIva.id'),
-        nullable=False
-    )
+    condicion_iva = Column(String, ForeignKey("CondicionFrenteIva.id"), nullable=False)
     productos = Column(JSON, nullable=False)
     valor_total = Column(Float(2), nullable=False)
-    fecha = Column(DateTime, default=datetime.today())
+    fecha = Column(DateTime, default=datetime.now)
 
     tipo_de_documento = relationship("TiposDeDocumentos")
     condicion_iva_rel = relationship("CondicionFrenteIva")
 
 
-# Crear las tablas en la base de datos
-Base.metadata.create_all(engine)
-
-# Crear una sesión
-Session = sessionmaker(bind=engine)
-session = Session()
-
-def inicializar_base_de_datos():
-    """
-    Inicializa la base de datos con datos predeterminados.
-    """
-    tipos_documentos = [
-        TiposDeDocumentos(nombre_de_tipo='CUIL'),
-        TiposDeDocumentos(nombre_de_tipo='CUIT'),
-        TiposDeDocumentos(nombre_de_tipo='DNI'),
-    ]
-
-    session.add_all(tipos_documentos)
-    session.commit()
-
-    condicion_iva = [
-        CondicionFrenteIva(nombre_de_condicion='Consumidor Final'),
-        CondicionFrenteIva(nombre_de_condicion='Iva Responsable Inscripto'),
-        CondicionFrenteIva(nombre_de_condicion='Iva Sujeto Exento'),
-    ]
-
-    session.add_all(condicion_iva)
-    session.commit()
-
-    print("Base de datos inicializada con éxito.")
-
-def verificar_inicializacion():
-    """
-    Verifica si la base de datos ya ha sido inicializada.
-    """
-    meta = session.query(Meta).first()
-    if meta is None:
-        meta = Meta(inicializado=False)
-        session.add(meta)
-        session.commit()
-    return meta.inicializado
-
-def marcar_inicializado():
-    """
-    Marca la base de datos como inicializada.
-    """
-    meta = session.query(Meta).first()
-    meta.inicializado = True
-    session.commit()
-
 def inicializar_si_necesario():
-    """
-    Inicializa la base de datos si no ha sido inicializada.
-    """
-    if not verificar_inicializacion():
-        inicializar_base_de_datos()
-        marcar_inicializado()
+    """Crea las tablas y carga los datos de referencia la primera vez."""
+    Base.metadata.create_all(engine)
+    with Session() as session:
+        meta = session.query(Meta).first()
+        if meta is None:
+            meta = Meta(inicializado=False)
+            session.add(meta)
+        if not meta.inicializado:
+            session.add_all(
+                TiposDeDocumentos(nombre_de_tipo=nombre)
+                for nombre in TIPOS_DE_DOCUMENTO
+            )
+            session.add_all(
+                CondicionFrenteIva(nombre_de_condicion=nombre)
+                for nombre in CONDICIONES_IVA
+            )
+            meta.inicializado = True
+        session.commit()
 
-# Crear las tablas
-Base.metadata.create_all(engine)
 
-if __name__ == "__main__":
-    inicializar_si_necesario()
-    session.close()
+def guardar_factura(id_cliente, tipo_documento, condicion_iva, productos, total):
+    """Guarda una factura emitida. `tipo_documento` y `condicion_iva` son nombres."""
+    with Session() as session:
+        tipo = (
+            session.query(TiposDeDocumentos)
+            .filter_by(nombre_de_tipo=tipo_documento)
+            .one()
+        )
+        # La base ya existente guarda "Exento"; la interfaz histórica decía "Excento".
+        indice = CONDICIONES_IVA.index(condicion_iva)
+        condicion = session.query(CondicionFrenteIva).order_by("id").all()[indice]
+        session.add(
+            Facturas(
+                id_cliente=id_cliente or None,
+                tipo_de_documento_id=tipo.id,
+                condicion_iva=condicion.id,
+                productos=productos,
+                valor_total=total,
+                fecha=datetime.now(),
+            )
+        )
+        session.commit()
+
+
+def listar_facturas():
+    """Devuelve todas las facturas, de la más reciente a la más antigua."""
+    with Session() as session:
+        return (
+            session.query(Facturas)
+            .options(
+                joinedload(Facturas.tipo_de_documento),
+                joinedload(Facturas.condicion_iva_rel),
+            )
+            .order_by(Facturas.fecha.desc(), Facturas.id.desc())
+            .all()
+        )

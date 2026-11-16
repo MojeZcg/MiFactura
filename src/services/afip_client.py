@@ -1,321 +1,288 @@
+"""Emisión de facturas automatizando "Comprobantes en línea" de ARCA con Selenium.
+
+Este módulo no toca la interfaz: informa el avance con `on_progress` y los
+fallos con `FacturacionError`, así puede ejecutarse en un hilo de trabajo.
+"""
+
+import logging
 import os
 import time
 from datetime import datetime
 
-from tkinter.messagebox import showerror
-from pathlib import Path
-from dotenv import load_dotenv
-
-
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support.ui import Select
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.keys import Keys
 from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
+from selenium.common.exceptions import TimeoutException, WebDriverException
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import Select, WebDriverWait
 
-from selenium.common.exceptions import TimeoutException
+from config import LOG_DIR, is_debug
+from services.comun import (
+    NO_EMITIDA,
+    SIN_VERIFICAR,
+    FacturacionError,
+    carpeta_de_descarga,
+)
 
-from webdriver_manager.chrome import ChromeDriverManager
+logger = logging.getLogger(__name__)
 
-from gui.progress import ProgressWindow
-from config import DEBUG
+LOGIN_URL = "https://auth.afip.gob.ar/contribuyente_/login.xhtml"
 
+# Posición de cada opción en los desplegables del formulario de ARCA.
+INDICE_TIPO_DOCUMENTO = {"CUIT": 0, "CUIL": 1, "DNI": 6}
+INDICE_CONDICION_IVA = {
+    "Consumidor Final": 3,
+    "Iva Responsable Inscripto": 1,
+    "Iva Sujeto Exento": 2,
+}
+INDICE_UNIDAD_MEDIDA = 7
 
-# Configuración de la carpeta de descargas
-
-
-def start_chrome():
-    """
-    Inicia una instancia del navegador Chrome con opciones predefinidas,
-    descargando automáticamente el driver compatible si es necesario.
-    """
-    load_dotenv()  # Cargar variables del .env
-
-    prefs = {
-        "download.default_directory": download_path,
-        "download.prompt_for_download": False,
-        "directory_upgrade": True,
-        "safebrowsing.enabled": True,
-    }
-
+def start_chrome(download_path):
+    """Inicia Chrome. Selenium descarga solo el driver compatible."""
     options = webdriver.ChromeOptions()
-    if not DEBUG:
-        options.add_argument("--headless")
-    options.add_experimental_option("excludeSwitches", ["enable-logging"])
+    if not is_debug():
+        options.add_argument("--headless=new")
+    options.add_argument("--window-size=1366,900")
     options.add_argument("--log-level=3")
-    options.add_argument("--disable-gpu")
-    options.add_experimental_option("prefs", prefs)
+    options.add_experimental_option("excludeSwitches", ["enable-logging"])
+    options.add_experimental_option(
+        "prefs",
+        {
+            "download.default_directory": str(download_path),
+            "download.prompt_for_download": False,
+            "download.directory_upgrade": True,
+            "plugins.always_open_pdf_externally": True,
+            "safebrowsing.enabled": True,
+        },
+    )
+    try:
+        return webdriver.Chrome(options=options)
+    except WebDriverException as error:
+        raise FacturacionError(
+            "No se pudo abrir Google Chrome. Verificá que esté instalado "
+            f"y que haya conexión a internet.\n\n{error.msg}"
+        ) from error
 
-    # Aquí se usa webdriver-manager para gestionar automáticamente el driver
-    service = Service(ChromeDriverManager().install())
 
-    driver = webdriver.Chrome(service=service, options=options)
-    return driver
+def _esperar(driver, condicion, segundos=20):
+    return WebDriverWait(driver, segundos).until(condicion)
+
+
+def _presente(driver, localizador, segundos=20):
+    return _esperar(driver, EC.presence_of_element_located(localizador), segundos)
+
+
+def _click(driver, localizador, segundos=20):
+    _esperar(driver, EC.element_to_be_clickable(localizador), segundos).click()
 
 
 def login(driver):
-    """
-    Realiza el inicio de sesión en la página de ARCA y navega a la sección
-    correspondiente.
+    """Inicia sesión en ARCA y entra a "Generar Comprobantes"."""
+    cuil = os.getenv("ARCA_CUIL")
+    clave = os.getenv("ARCA_KEY")
+    if not cuil or not clave:
+        raise FacturacionError(
+            "Faltan el CUIT o la clave fiscal. Cargalos en Configuración."
+        )
 
-    Args:
-        driver (WebDriver): La instancia del controlador de Chrome.
-    """
-    load_dotenv()
+    driver.get(LOGIN_URL)
+    usuario = _presente(driver, (By.ID, "F1:username"))
+    usuario.clear()
+    usuario.send_keys(cuil, Keys.RETURN)
+
+    campo_clave = _presente(driver, (By.NAME, "F1:password"))
+    campo_clave.clear()
+    campo_clave.send_keys(clave, Keys.RETURN)
 
     try:
-        driver.get("https://auth.afip.gob.ar/contribuyente_/login.xhtml")
+        _click(driver, (By.CSS_SELECTOR, "a.full-width"), 15)
+    except TimeoutException as error:
+        raise FacturacionError(
+            "ARCA no aceptó el inicio de sesión. Verificá el CUIT y la clave "
+            "fiscal en Configuración."
+        ) from error
 
-        username = WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.ID, "F1:username"))
-        )
+    # El servicio de comprobantes se abre en una pestaña nueva.
+    _esperar(driver, lambda d: len(d.window_handles) > 1, 15)
+    driver.switch_to.window(driver.window_handles[-1])
 
-        # Ingresar el Cuil Correspondiente
-        username.clear()
-        arca_cuil = os.getenv("ARCA_CUIL")
-
-        if arca_cuil is None:
-            raise ValueError("La variable de entorno 'ARCA_CUIL' no está definida.")
-
-        username.send_keys(arca_cuil)
-        username.send_keys(Keys.RETURN)
-
-        # Selecciona el campo Clave
-        password = WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.NAME, "F1:password"))
-        )
-
-        # Ingresar la Clave Correspondiente
-        password.clear()
-        arca_key = os.getenv("ARCA_KEY")
-
-        if arca_key is None:
-            raise ValueError("La variable de entorno 'ARCA_KEY' no está definida.")
-
-        password.send_keys(arca_key)
-        password.send_keys(Keys.RETURN)
-
-        # Ingresa a responsable inscripto
-        WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "a.full-width"))
-        ).click()
-
-        time.sleep(1)
-
-        driver.switch_to.window(driver.window_handles[-1])
-
-        WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.CSS_SELECTOR, 'input[type="button"]'))
-        ).click()
-
-        WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.ID, "btn_gen_cmp"))
-        ).click()
-
-        print("\n Inicio de sesión exitoso y navegación completada. \n")
-
-    except (TimeoutError, RuntimeError, ValueError) as e:
-        showerror(title="Error", message="Fallo al iniciar sesión.")
-        print(f"error: {e}")
+    _click(driver, (By.CSS_SELECTOR, 'input[type="button"]'))
+    _click(driver, (By.ID, "btn_gen_cmp"))
 
 
 def put_all_items(driver, products):
-    """
-    Ingresa una lista de productos en un formulario web usando Selenium.
-
-    Args:
-        driver (selenium.webdriver): El controlador de Selenium WebDriver.
-        products (list): Lista de diccionarios con claves 'Product', 'Quantity', y 'Price'.
-    """
+    """Carga las líneas de detalle de la factura."""
     for index, product in enumerate(products, start=1):
-        WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.ID, f"detalle_descripcion{index}"))
-        ).send_keys(product["Product"])
-
-        quantity = WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.ID, f"detalle_cantidad{index}"))
+        _presente(driver, (By.ID, f"detalle_descripcion{index}")).send_keys(
+            product["Product"]
         )
-        quantity.clear()
-        quantity.send_keys(product["Quantity"])
-        detalleselect = Select(
-            WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located((By.ID, f"detalle_medida{index}"))
+
+        cantidad = _presente(driver, (By.ID, f"detalle_cantidad{index}"))
+        cantidad.clear()
+        cantidad.send_keys(product["Quantity"])
+
+        Select(_presente(driver, (By.ID, f"detalle_medida{index}"))).select_by_index(
+            INDICE_UNIDAD_MEDIDA
+        )
+
+        _presente(driver, (By.ID, f"detalle_precio{index}")).send_keys(
+            product["Price"]
+        )
+
+        if index < len(products):
+            _click(
+                driver,
+                (
+                    By.XPATH,
+                    '//input[@type="button" and @value="Agregar línea descripción"]',
+                ),
             )
-        )
-        detalleselect.select_by_index(7)
-
-        preciou = WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.ID, f"detalle_precio{index}"))
-        )
-        preciou.send_keys(product["Price"])
-        if len(products) >= index + 1:
-            WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located(
-                    (
-                        By.XPATH,
-                        '//input[@type="button" and @value="Agregar línea descripción"]',
-                    )
-                )
-            ).click()
 
 
 def siguiente(driver):
-    """
-    Hace clic en el botón "Continuar" en la página actual del navegador.
+    """Avanza al siguiente paso del formulario."""
+    _click(driver, (By.XPATH, '//input[@value="Continuar >"]'))
+
+
+def esperar_descarga(folder, existentes, timeout=30):
+    """Espera un archivo nuevo y completo en `folder`. Devuelve su ruta o None."""
+    limite = time.time() + timeout
+    while time.time() < limite:
+        nuevos = [f for f in folder.iterdir() if f.name not in existentes]
+        completos = [
+            f for f in nuevos if f.suffix.lower() not in (".tmp", ".crdownload")
+        ]
+        if completos and len(completos) == len(nuevos):
+            return max(completos, key=lambda f: f.stat().st_mtime)
+        time.sleep(0.5)
+    return None
+
+
+def _guardar_captura(driver):
+    """Guarda una captura del navegador para diagnosticar el fallo."""
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        ruta = LOG_DIR / f"error_{datetime.now():%Y%m%d_%H%M%S}.png"
+        driver.save_screenshot(str(ruta))
+        return ruta
+    except (WebDriverException, OSError):
+        return None
+
+
+def emitir_factura(tipo_documento, client_id, condicion_iva, products, on_progress=None):
+    """Emite una factura en ARCA.
 
     Args:
-        driver (WebDriver): La instancia del controlador de Chrome.
+        tipo_documento (str): "CUIT", "CUIL" o "DNI".
+        client_id (str): Número de documento del cliente (puede ser vacío).
+        condicion_iva (str): Condición frente al IVA del cliente.
+        products (list): Dicts con 'Product', 'Quantity' y 'Price' (textos).
+        on_progress (callable): Recibe (porcentaje, mensaje).
+
+    Returns:
+        dict: {"emitida": bool, "pdf": Path | None, "carpeta": Path}
+
+    Raises:
+        FacturacionError: si la factura no llegó a emitirse.
     """
-    WebDriverWait(driver, 10).until(
-        EC.presence_of_element_located((By.XPATH, '//input[@value="Continuar >"]'))
-    ).click()
+    # pylint: disable=too-many-statements
+    etapa = "Preparando"
 
+    def paso(porcentaje, mensaje):
+        nonlocal etapa
+        etapa = mensaje
+        logger.info("%s%% %s", porcentaje, mensaje)
+        if on_progress:
+            on_progress(porcentaje, mensaje)
 
-def esperar_descarga_completa(folder, timeout=20):
-    """
-    Espera hasta que no haya archivos .tmp o .crdownload en la carpeta de descargas.
-    """
-    start = time.time()
-    while time.time() - start < timeout:
-        if not any(f.endswith((".tmp", ".crdownload")) for f in os.listdir(folder)):
-            print("[INFO] Descarga finalizada.")
-            return True
-        time.sleep(1)
-    print("[ERROR] La descarga no se completó a tiempo.")
-    return False
-
-
-def realizar_operacion(client_option, client_id, option, products):
-    """
-    Realiza una operación de facturación en la página de ARCA.
-
-    Args:
-        driver (WebDriver): Controlador del navegador.
-        client_option (int): Tipo de documento del cliente.
-        client_id (str): Número de documento del cliente.
-        option (int): Condición frente al IVA.
-        products (list): Lista de productos.
-        debug (bool): Si es True, no confirma ni descarga la factura.
-    """
-    fecha_actual = datetime.now()
-    nombre_carpeta = fecha_actual.strftime("%d de %B %Y")
-
-    default_path = Path(str(os.getenv("DOWNLOAD_PATH")))
-
-    download_path = os.path.join(default_path, nombre_carpeta)
-
-    # Crear la carpeta de descargas si no existe
-    if not os.path.exists(download_path):
-        os.makedirs(download_path)
-
-    driver = start_chrome()
-
-    progress = ProgressWindow(None, "Facturación")
+    carpeta = carpeta_de_descarga()
+    paso(3, "Abriendo el navegador")
+    driver = start_chrome(carpeta)
+    resultado = {"emitida": False, "pdf": None, "carpeta": carpeta}
+    confirmacion_enviada = False
+    no_emitida, sin_verificar = NO_EMITIDA, SIN_VERIFICAR
 
     try:
+        paso(10, "Iniciando sesión en ARCA")
         login(driver)
 
         try:
-            WebDriverWait(driver, 5).until(
-                EC.element_to_be_clickable((By.ID, "novolveramostrar"))
-            ).click()
-            print("[INFO] Se clickeó novolveramostrar")
+            _click(driver, (By.ID, "novolveramostrar"), 4)
         except TimeoutException:
-            print(
-                "[INFO] El botón 'novolveramostrar' no apareció. Continuando sin hacer clic."
-            )
+            pass
 
-        punto_venta = WebDriverWait(driver, 20).until(
-            EC.presence_of_element_located((By.NAME, "puntoDeVenta"))
-        )
-        Select(punto_venta).select_by_index(1)
-
-        time.sleep(2)
-
-        siguiente(driver)
-        progress.set_progress(18)
-
-        concepto = WebDriverWait(driver, 20).until(
-            EC.presence_of_element_located((By.ID, "idconcepto"))
-        )
-        Select(concepto).select_by_index(1)
-
-        siguiente(driver)
-        progress.set_progress(25)
-
-        condicion_iva = WebDriverWait(driver, 20).until(
-            EC.presence_of_element_located((By.ID, "idivareceptor"))
-        )
-        Select(condicion_iva).select_by_index(option)
-        progress.set_progress(30)
-
-        tipo_doc = WebDriverWait(driver, 20).until(
-            EC.presence_of_element_located((By.ID, "idtipodocreceptor"))
-        )
-        Select(tipo_doc).select_by_index(client_option)
-        progress.set_progress(45)
-
-        nro_doc = WebDriverWait(driver, 20).until(
-            EC.presence_of_element_located((By.ID, "nrodocreceptor"))
-        )
-        nro_doc.send_keys(client_id)
-        progress.set_progress(52)
-
-        WebDriverWait(driver, 20).until(
-            EC.element_to_be_clickable((By.ID, "formadepago1"))
-        ).click()
-        progress.set_progress(60)
-
+        paso(25, "Eligiendo el punto de venta")
+        Select(_presente(driver, (By.NAME, "puntoDeVenta"))).select_by_index(1)
+        time.sleep(2)  # ARCA carga el tipo de comprobante al elegir el punto de venta
         siguiente(driver)
 
+        paso(35, "Cargando el concepto")
+        Select(_presente(driver, (By.ID, "idconcepto"))).select_by_index(1)
+        siguiente(driver)
+
+        paso(45, "Cargando los datos del cliente")
+        Select(_presente(driver, (By.ID, "idivareceptor"))).select_by_index(
+            INDICE_CONDICION_IVA[condicion_iva]
+        )
+        Select(_presente(driver, (By.ID, "idtipodocreceptor"))).select_by_index(
+            INDICE_TIPO_DOCUMENTO[tipo_documento]
+        )
+        if client_id:
+            _presente(driver, (By.ID, "nrodocreceptor")).send_keys(client_id)
+        _click(driver, (By.ID, "formadepago1"))
+        siguiente(driver)
+
+        paso(60, "Cargando los productos")
         put_all_items(driver, products)
-        progress.set_progress(75)
-
         siguiente(driver)
-        progress.set_progress(80)
 
-        print("[INFO] Datos ingresados correctamente.")
+        if is_debug():
+            paso(100, "Simulación terminada (modo DEBUG: no se confirmó)")
+            return resultado
 
-        if not DEBUG:
-            WebDriverWait(driver, 10).until(
-                EC.element_to_be_clickable(
-                    (
-                        By.XPATH,
-                        '//input[@type="button" and @value="Confirmar Datos..."]',
-                    )
-                )
-            ).click()
-            progress.set_progress(85)
+        paso(80, "Confirmando la factura")
+        existentes = {f.name for f in carpeta.iterdir()}
+        confirmacion_enviada = True
+        _click(
+            driver,
+            (By.XPATH, '//input[@type="button" and @value="Confirmar Datos..."]'),
+        )
+        try:
+            _esperar(driver, EC.alert_is_present(), 5)
+            driver.switch_to.alert.accept()
+        except TimeoutException:
+            pass
 
-            try:
-                WebDriverWait(driver, 5).until(EC.alert_is_present())
-                alert = driver.switch_to.alert
-                print(f"[ALERTA] {alert.text}")
-                alert.accept()
-            except TimeoutException:
-                print("[INFO] No apareció ninguna alerta de confirmación.")
+        boton_imprimir = (By.XPATH, '//input[@type="button" and @value="Imprimir..."]')
+        _esperar(driver, EC.element_to_be_clickable(boton_imprimir))
+        # Si aparece "Imprimir...", ARCA ya generó el comprobante.
+        resultado["emitida"] = True
 
-            # Clic en "Imprimir..."
-            WebDriverWait(driver, 10).until(
-                EC.element_to_be_clickable(
-                    (By.XPATH, '//input[@type="button" and @value="Imprimir..."]')
-                )
-            ).click()
+        paso(90, "Descargando el PDF")
+        try:
+            driver.find_element(*boton_imprimir).click()
+            resultado["pdf"] = esperar_descarga(carpeta, existentes)
+        except WebDriverException:
+            logger.exception("La factura se emitió pero falló la descarga del PDF")
 
-            # Esperar la descarga
-            esperar_descarga_completa(download_path)
+        paso(100, "Factura emitida")
+        return resultado
 
-            progress.set_progress(97)
-            print("[INFO] Factura confirmada y descargada correctamente.")
-        else:
-            print("[DEBUG] Simulación activa: no se confirmó ni descargó la factura.")
-
-    except (TimeoutError, RuntimeError, ValueError) as e:
-        print(f"[ERROR] {type(e).__name__}: {e}")
-
+    except TimeoutException as error:
+        captura = _guardar_captura(driver)
+        logger.exception("Tiempo de espera agotado en: %s", etapa)
+        detalle = f"\n\nCaptura guardada en:\n{captura}" if captura else ""
+        raise FacturacionError(
+            f"ARCA no respondió como se esperaba en el paso «{etapa}».\n"
+            + (sin_verificar if confirmacion_enviada else no_emitida)
+            + detalle
+        ) from error
+    except WebDriverException as error:
+        _guardar_captura(driver)
+        logger.exception("Error del navegador en: %s", etapa)
+        raise FacturacionError(
+            f"Falló el navegador en el paso «{etapa}».\n"
+            f"{sin_verificar if confirmacion_enviada else no_emitida}\n\n{error.msg}"
+        ) from error
     finally:
-        progress.set_progress(100)
         driver.quit()
-        progress.stop_progress()

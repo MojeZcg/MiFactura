@@ -1,25 +1,32 @@
-"""Aplicación principal de MiFactura ARCA."""
+"""Ventana principal de MiFactura."""
 
+import logging
 import os
+import queue
 import threading
-from tkinter.messagebox import showwarning, showinfo
+from tkinter import messagebox
+
 import ttkbootstrap as ttk
-from dotenv import load_dotenv
-from config import ICON_PATH
-from utils.env import update_arca_key
 
-from models.database import session
-from models.downloads import download
-from models.database import (
-    Facturas,
+from config import ICON_PATH, is_configured, is_debug
+from gui.dialogs import HistoryDialog, SettingsDialog
+from models.database import CONDICIONES_IVA, guardar_factura
+from services.facturacion import (
+    FacturacionError,
+    descripcion_comprobante,
+    emitir_factura,
+    motor,
 )
-from services.afip_client import realizar_operacion
+from utils.formato import (
+    cuit_valido,
+    formatear_cuit,
+    formatear_pesos,
+    numero_a_texto,
+    parsear_numero,
+    solo_digitos,
+)
 
-CONDITION_OPTIONS = [
-    "Consumidor Final",
-    "Iva Responsable Inscripto",
-    "Iva Sujeto Excento",
-]
+logger = logging.getLogger(__name__)
 
 PREAJUSTES_PRODUCTOS = [
     "Fotos Carnet",
@@ -28,498 +35,551 @@ PREAJUSTES_PRODUCTOS = [
     "Estampados",
 ]
 
+TIPOS_POR_CONDICION = {
+    CONDICIONES_IVA[0]: ("DNI", "CUIT", "CUIL"),
+    CONDICIONES_IVA[1]: ("CUIT",),
+    CONDICIONES_IVA[2]: ("CUIT",),
+}
+
+FUENTE_MARCA = ("Segoe UI Semibold", 17)
+FUENTE_SECCION = ("Segoe UI Semibold", 11)
+FUENTE_AYUDA = ("Segoe UI", 9)
+FUENTE_TOTAL = ("Segoe UI Semibold", 24)
+FUENTE_BOTON = ("Segoe UI Semibold", 12)
+
 
 class App:
     # pylint: disable=too-many-instance-attributes
-    """
-    Crea la clase de la aplicación.
-    """
+    """Interfaz principal: armado de la factura y emisión en segundo plano."""
 
-    def __init__(self, r):
-        # pylint: disable=too-many-statements
-        """
-        Inicializa la interfaz de la aplicación.
+    def __init__(self, root):
+        self.root = root
+        self.items = {}  # iid de la tabla -> (descripción, cantidad, precio)
+        self.eventos = queue.Queue()
+        self.ocupado = False
+        self._formateando = False
 
-        Args:
-            root (ttk.Window): La instancia de la ventana raíz de tkinter.
-        """
-        self.root = r
+        root.title("MiFactura")
+        try:
+            root.iconbitmap(ICON_PATH)
+        except Exception:  # pylint: disable=broad-except
+            pass
+        self._crear_encabezado()
+        self._crear_estado()
+        self._crear_cuerpo()
+        estilo = ttk.Style()
+        estilo.configure(self.boton_emitir.cget("style"), font=FUENTE_BOTON)
+        estilo.configure("Treeview", rowheight=self._px(30))
 
-        # Configuracion de la pestaña root
-        self.root.title("MiFactura ARCA")
+        # El tamaño sale del contenido, así se ve bien con cualquier escala de Windows.
+        root.update_idletasks()
+        ancho = max(root.winfo_reqwidth(), self._px(980))
+        alto = max(root.winfo_reqheight(), self._px(620))
+        root.minsize(root.winfo_reqwidth(), root.winfo_reqheight())
+        self._centrar(ancho, alto)
 
-        width, height = 612, 440
+        self._al_cambiar_condicion()
+        self._actualizar_total()
+        self.descripcion.focus_set()
 
-        screen_width = self.root.winfo_screenwidth()
-        screen_height = self.root.winfo_screenheight()
-        x = int((screen_width / 2) - (width / 2))
-        y = int((screen_height / 2) - (height / 2))
-        self.root.geometry(f"{width}x{height}+{x}+{y}")
-        self.root.resizable(False, False)
+    # ------------------------------------------------------------------ UI
 
-        self.root.iconbitmap(ICON_PATH)
+    def _px(self, valor):
+        """Convierte píxeles de diseño (96 dpi) a píxeles reales de pantalla."""
+        return round(valor * self.root.winfo_fpixels("1i") / 96)
 
-        menu_bar = ttk.Menu(self.root)
-        self.root.config(menu=menu_bar)
+    def _centrar(self, ancho, alto):
+        x = (self.root.winfo_screenwidth() - ancho) // 2
+        y = (self.root.winfo_screenheight() - alto) // 3
+        self.root.geometry(f"{ancho}x{alto}+{x}+{max(y, 0)}")
 
-        config_menu = ttk.Menu(menu_bar, tearoff=0)
-        menu_bar.add_cascade(label="Descargar", menu=config_menu)
-        config_menu.add_command(label="Descargar historial", command=download)
+    def _crear_encabezado(self):
+        barra = ttk.Frame(self.root, bootstyle="primary", padding=(24, 14))
+        barra.pack(fill="x")
 
-        config_menu1 = ttk.Menu(menu_bar, tearoff=0)
-        menu_bar.add_cascade(label="Configuración", menu=config_menu1)
-        config_menu1.add_command(
-            label="Actualizar Contraseña", command=self.show_update_window
-        )
-
-        self.client_options = ("CUIT", "CUIL", "DNI")
-        self.client_var = ttk.StringVar(value=self.client_options[0])
-
-        # Crear campos de entrada del id del cliente
-        ttk.Label(r, text="Identificador del cliente:").place(x=10, y=10)
-        self.client_type = ttk.OptionMenu(
-            r,
-            self.client_var,
-            self.client_options[0],
-            *self.client_options,
-            bootstyle="dark",
-        )
-        self.client_type.place(x=10, y=32, width=75)
-
-        self.client = ttk.StringVar()
-        self.client.trace_add("write", self.format_client_id)
-
-        self.client_entry = ttk.Entry(r, textvariable=self.client)
-        self.client_entry.place(x=90, y=32, width=120)
-
-        # Crear campo y opciones para el OptionMenu
-        self.option_var = ttk.StringVar(value=CONDITION_OPTIONS[0])
-        self.options = (
-            CONDITION_OPTIONS[0],
-            CONDITION_OPTIONS[1],
-            CONDITION_OPTIONS[2],
-        )
-
-        ttk.Label(r, text="Condición frente al IVA:").place(x=220, y=10)
-        self.option = ttk.OptionMenu(
-            r,
-            self.option_var,
-            self.options[0],
-            *self.options,
-            command=self.update_client_options,
-            bootstyle="dark",
-        )
-        self.option.place(x=220, y=32, width=200, height=30)
-        # Llamar a update_client_options al inicio
-        # para inicializar correctamente
-        self.update_client_options(self.options[0])
-
-        # Crear tabla
-        self.tree = ttk.Treeview(
-            r,
-            bootstyle="dark",
-            columns=("name", "quantity", "unique_price", "total_price"),
-            show="headings",
-        )
-        self.tree.heading("name", text="Nombre")
-        self.tree.heading("quantity", text="Cantidad (Unidades)")
-        self.tree.heading("unique_price", text="Precio por Unidad ($)")
-        self.tree.heading("total_price", text="Precio Parcial ($)")
-
-        self.tree.column("name", width=150)
-        self.tree.column("quantity", anchor=ttk.E, width=150)
-        self.tree.column("unique_price", anchor=ttk.E, width=150)
-        self.tree.column("total_price", anchor=ttk.E, width=140)
-        self.tree.place(x=5, y=75, width=600)
-
-        # Crear campo y opciones para el OptionMenu
-        self.common_products = PREAJUSTES_PRODUCTOS
-
-        ttk.Label(r, text="Nombre de producto:").place(x=10, y=265)
-        self.name = ttk.Combobox(r, bootstyle="secondary", values=self.common_products)
-
-        self.name.place(x=10, y=285, height=25, width=150)
-
-        ttk.Label(r, text="Cantidad:").place(x=10, y=315)
-        self.quantity = ttk.Entry(r, bootstyle="secondary")
-        self.quantity.place(x=10, y=335, height=25, width=150)
-
-        ttk.Label(r, text="Precio Unitario:").place(x=10, y=365)
-        self.priceu = ttk.Entry(r, bootstyle="secondary")
-        self.priceu.place(x=10, y=385, height=25, width=150)
-
-        self.add_row_button = ttk.Button(
-            r,
-            bootstyle="default-outline",
-            text="Agregar Producto",
-            command=self.add_row,
-        )
-        self.add_row_button.place(x=180, y=295, width=150, height=35)
-
-        self.remove_row_button = ttk.Button(
-            r,
-            bootstyle="danger-outline",
-            text="Eliminar Seleccionados",
-            command=self.delete_rows,
-        )
-        self.remove_row_button.place(x=180, y=340, width=150, height=30)
-
-        self.remove_all_button = ttk.Button(
-            r, bootstyle="dark", text="Eliminar Todos", command=self.delete_all_rows
-        )
-        self.remove_all_button.place(x=180, y=380, width=150, height=30)
-
-        self.text_total = ttk.Label(r, bootstyle="dark", text="Total: 0$")
-        self.text_total.place(x=595, y=348, anchor="e")
-
-        # Botón para ejecutar las funciones de Selenium
-        self.send_button = ttk.Button(
-            r, bootstyle="success-outline", text="Facturar", command=self.send
-        )
-        self.send_button.place(x=400, y=370, width=200, height=40)
-
-        self.error_label = ttk.Label(r, text="", bootstyle="danger")
-        self.error_label.place(x=330, y=390)
-
-        self.raw_client_id = ""
-
-    def show_update_window(self):
-        """
-        Muestra una ventana para actualizar la clave ARCA_KEY.
-        """
-
-        def submit():
-            """
-            Obtiene el nuevo valor de la entrada y actualiza la clave ARCA_KEY.
-            Muestra una advertencia si el campo está vacío y una notificación
-            si la actualización es exitosa.
-            """
-            new_value = entry.get()
-            if not new_value:
-                showwarning("Advertencia", "El campo no puede estar vacío")
-                return
-            update_arca_key(new_value)
-            showinfo("Éxito", "Cambiaste la contraseña de arca.")
-            update_window.destroy()
-
-        load_dotenv()
-
-        update_window = ttk.Toplevel(self.root)
-        update_window.geometry("280x115")
-        update_window.resizable(False, False)
-        update_window.iconbitmap(ICON_PATH)
-        update_window.title("Actualizar ARCA_KEY")
-
-        ttk.Label(update_window, text="Contraseña actual: ").place(x=15, y=10)
-        current_key = os.getenv("ARCA_KEY")
-        ttk.Label(update_window, text=current_key, bootstyle="secondary").place(
-            x=130, y=10
-        )
-
-        ttk.Label(update_window, text="Nueva Contraseña:").place(x=15, y=40)
-        entry = ttk.Entry(update_window, bootstyle="dark")
-        entry.place(x=130, y=35)
+        marca = ttk.Frame(barra, bootstyle="primary")
+        marca.pack(side="left")
+        ttk.Label(
+            marca, text="MiFactura", font=FUENTE_MARCA, bootstyle="inverse-primary"
+        ).pack(anchor="w")
+        ttk.Label(
+            marca,
+            text="Facturación electrónica ARCA",
+            font=FUENTE_AYUDA,
+            bootstyle="inverse-primary",
+        ).pack(anchor="w")
 
         ttk.Button(
-            update_window, text="Actualizar", command=submit, bootstyle="dark"
-        ).place(x=163, y=75, width=100)
+            barra,
+            text="Configuración",
+            bootstyle="primary",
+            command=self.abrir_configuracion,
+        ).pack(side="right")
+        ttk.Button(
+            barra, text="Historial", bootstyle="primary", command=self.abrir_historial
+        ).pack(side="right", padx=4)
 
-    def obtener_valores_columna(self):
-        """
-        Obtiene los valores de una columna específica del widget 'tree'.
+    def _crear_estado(self):
+        pie = ttk.Frame(self.root)
+        pie.pack(side="bottom", fill="x")
+        ttk.Separator(pie).pack(fill="x")
+        fila = ttk.Frame(pie, padding=(24, 8))
+        fila.pack(fill="x")
+        self.estado = ttk.Label(fila, text="", bootstyle="secondary")
+        self.estado.pack(side="left")
+        self.progreso = ttk.Progressbar(
+            fila, maximum=100, length=240, bootstyle="success-striped"
+        )
+        self._estado("Listo para facturar.")
 
-        Recorre todos los elementos del widget 'tree' y extrae los valores de la
-        cuarta columna ('values')[3]. Luego, agrega estos valores a una lista y
-        la devuelve.
+    def _crear_cuerpo(self):
+        cuerpo = ttk.Frame(self.root, padding=(24, 20, 24, 16))
+        cuerpo.pack(fill="both", expand=True)
+        cuerpo.columnconfigure(1, weight=1)
+        cuerpo.rowconfigure(0, weight=1)
 
-        Returns:
-            list: Una lista de valores de la cuarta columna de cada elemento del 'tree'.
-        """
-        valores = []
-        for item_id in self.tree.get_children():
-            valor_columna = self.tree.item(item_id, "values")[3]
-            valores.append(valor_columna)
-        return valores
+        izquierda = ttk.Frame(cuerpo, width=300)
+        izquierda.grid(row=0, column=0, sticky="ns", padx=(0, 24))
+        self._crear_cliente(izquierda)
+        ttk.Separator(izquierda).pack(fill="x", pady=18)
+        self._crear_producto(izquierda)
 
-    def actualizar_label(self):
-        """
-        Actualiza el texto de un label con la suma de los valores de una columna específica.
+        derecha = ttk.Frame(cuerpo)
+        derecha.grid(row=0, column=1, sticky="nsew")
+        self._crear_detalle(derecha)
 
-        Obtiene los valores de la cuarta columna de cada elemento del widget 'tree'
-        usando la función 'obtener_valores_columna', los suma y actualiza el texto del
-        widget 'text_total' para mostrar el total en dólares.
-        """
-        valores = self.obtener_valores_columna()
-        resultado = 0
-        for valor in valores:
-            resultado += float(valor)
-        self.text_total.config(text=f"Total: {resultado:,.2f}$")
+    def _crear_cliente(self, padre):
+        ttk.Label(padre, text="Cliente", font=FUENTE_SECCION).pack(anchor="w")
 
-    def format_client_id(self, *args):
-        """
-        Formatea el ID del cliente en el formato 'XX-XXXXXXXX-X' para CUIT o CUIL.
+        ttk.Label(padre, text="Condición frente al IVA").pack(anchor="w", pady=(10, 4))
+        self.condicion = ttk.Combobox(
+            padre, values=CONDICIONES_IVA, state="readonly", width=34
+        )
+        self.condicion.set(CONDICIONES_IVA[0])
+        self.condicion.pack(fill="x")
+        self.condicion.bind("<<ComboboxSelected>>", self._al_cambiar_condicion)
 
-        Dependiendo del tipo de cliente seleccionado (CUIT o CUIL), limpia y formatea
-        el valor del ID del cliente ingresado en el campo de entrada. Mantiene la
-        posición actual del cursor adecuada al nuevo formato.
+        ttk.Label(padre, text="Documento").pack(anchor="w", pady=(12, 4))
+        fila = ttk.Frame(padre)
+        fila.pack(fill="x")
+        self.tipo_documento = ttk.Combobox(fila, state="readonly", width=6)
+        self.tipo_documento.pack(side="left")
+        self.tipo_documento.bind("<<ComboboxSelected>>", self._formatear_documento)
 
-        Args:
-            *args: Argumentos adicionales que pueden ser pasados a la función, pero no
-                se utilizan directamente.
-        """
-        client_var = self.client_var.get()
-        cursor = self.client_entry.index(ttk.INSERT)
-        if client_var in ("CUIT", "CUIL"):
-            # Guardar la posición actual del cursor
+        self.documento_var = ttk.StringVar()
+        self.documento_var.trace_add("write", self._formatear_documento)
+        self.documento = ttk.Entry(fila, textvariable=self.documento_var)
+        self.documento.pack(side="left", fill="x", expand=True, padx=(8, 0))
 
-            new_value = self.client.get()
-            clean = "".join(filter(str.isdigit, new_value))
+        self.ayuda_documento = ttk.Label(
+            padre, text="", bootstyle="secondary", font=FUENTE_AYUDA
+        )
+        self.ayuda_documento.pack(anchor="w", pady=(4, 0))
 
-            # Formatear el valor limpio
-            formatted_value = f"{clean[0:2]}-{clean[2:10]}-{clean[10:11]}"
+    def _crear_producto(self, padre):
+        ttk.Label(padre, text="Agregar producto", font=FUENTE_SECCION).pack(anchor="w")
 
-            # Ajustar el valor del campo de entrada
-            self.client.set(formatted_value)
-            self.raw_client_id = clean
+        ttk.Label(padre, text="Descripción").pack(anchor="w", pady=(10, 4))
+        self.descripcion = ttk.Combobox(padre, values=PREAJUSTES_PRODUCTOS)
+        self.descripcion.pack(fill="x")
 
-            # Calcular la nueva posición del cursor
-            clean_cursor_position = sum(1 for c in new_value[:cursor] if c.isdigit())
-            if clean_cursor_position <= 2:
-                new_cursor = clean_cursor_position
-            elif clean_cursor_position <= 10:
-                new_cursor = clean_cursor_position + 1  # Compensar el primer guion
-            else:
-                new_cursor = clean_cursor_position + 2  # Compensar ambos guiones
+        fila = ttk.Frame(padre)
+        fila.pack(fill="x", pady=(12, 0))
+        fila.columnconfigure((0, 1), weight=1, uniform="campo")
+        ttk.Label(fila, text="Cantidad").grid(row=0, column=0, sticky="w")
+        ttk.Label(fila, text="Precio unitario ($)").grid(
+            row=0, column=1, sticky="w", padx=(8, 0)
+        )
+        self.cantidad = ttk.Entry(fila, width=10, justify="right")
+        self.cantidad.insert(0, "1")
+        self.cantidad.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        self.precio = ttk.Entry(fila, width=10, justify="right")
+        self.precio.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=(4, 0))
 
-            # Establecer la nueva posición del cursor
-            self.client_entry.icursor(new_cursor)
-            if not args:
-                print("noargs")
+        ttk.Button(
+            padre,
+            text="Agregar a la factura",
+            bootstyle="primary-outline",
+            command=self.agregar_producto,
+        ).pack(fill="x", pady=(16, 0))
 
-    def update_client_options(self, selected_option):
-        """
-        Actualiza las opciones del identificador del cliente en función de la
-        condición frente al IVA seleccionada.
+        for campo in (self.descripcion, self.cantidad, self.precio):
+            campo.bind("<Return>", lambda _e: self.agregar_producto())
 
-        Args:
-            selected_option (str): La condición frente al IVA seleccionada.
-        """
-        if selected_option in {CONDITION_OPTIONS[1], CONDITION_OPTIONS[2]}:
-            new_client_options = ("CUIT",)
-        else:  # Consumidor Final
-            new_client_options = ("CUIT", "CUIL", "DNI")
+    def _crear_detalle(self, padre):
+        padre.columnconfigure(0, weight=1)
+        padre.rowconfigure(1, weight=1)
 
-        # Actualizar las opciones del primer OptionMenu
-        menu = self.client_type["menu"]
-        menu.delete(0, "end")  # pylint: disable=no-member
+        encabezado = ttk.Frame(padre)
+        encabezado.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 10))
+        ttk.Label(encabezado, text="Detalle de la factura", font=FUENTE_SECCION).pack(
+            side="left"
+        )
+        self.contador = ttk.Label(encabezado, text="", bootstyle="secondary")
+        self.contador.pack(side="left", padx=10)
+        self.boton_vaciar = ttk.Button(
+            encabezado,
+            text="Vaciar",
+            bootstyle="secondary-link",
+            command=self.vaciar,
+        )
+        self.boton_vaciar.pack(side="right")
+        self.boton_quitar = ttk.Button(
+            encabezado,
+            text="Quitar seleccionados",
+            bootstyle="danger-link",
+            command=self.quitar_seleccionados,
+        )
+        self.boton_quitar.pack(side="right")
 
-        for option in new_client_options:
-            menu.add_command(  # pylint: disable=no-member
-                label=option, command=lambda value=option: self.client_var.set(value)
+        columnas = (
+            ("descripcion", "Descripción", 220, "w"),
+            ("cantidad", "Cantidad", 80, "e"),
+            ("precio", "Precio unitario", 120, "e"),
+            ("subtotal", "Subtotal", 120, "e"),
+        )
+        self.tabla = ttk.Treeview(
+            padre, columns=[c[0] for c in columnas], show="headings", height=8
+        )
+        for clave, titulo, ancho, alineacion in columnas:
+            self.tabla.heading(clave, text=titulo, anchor=alineacion)
+            self.tabla.column(
+                clave,
+                width=self._px(ancho),
+                minwidth=self._px(80),
+                anchor=alineacion,
+                stretch=clave == "descripcion",
             )
+        barra = ttk.Scrollbar(
+            padre, orient="vertical", command=self.tabla.yview, bootstyle="round"
+        )
+        self.tabla.configure(yscrollcommand=barra.set)
+        self.tabla.grid(row=1, column=0, sticky="nsew")
+        barra.grid(row=1, column=1, sticky="ns")
+        self.tabla.bind("<Delete>", lambda _e: self.quitar_seleccionados())
 
-        # Establecer la opción predeterminada
-        self.client_var.set(new_client_options[0])
+        pie = ttk.Frame(padre)
+        pie.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(16, 0))
+        totales = ttk.Frame(pie)
+        totales.pack(side="left")
+        ttk.Label(
+            totales, text="TOTAL", bootstyle="secondary", font=FUENTE_AYUDA
+        ).pack(anchor="w")
+        self.total = ttk.Label(totales, text="", font=FUENTE_TOTAL)
+        self.total.pack(anchor="w")
 
-    def add_row(self):
-        """
-        Agrega un producto a la tabla de productos.
-        """
-        if (
-            self.name.get() == ""
-            or self.quantity.get() == ""
-            or self.priceu.get() == ""
-        ):
-            self.error_label.config(text="Error: Falta informacion en el producto")
+        self.boton_emitir = ttk.Button(
+            pie,
+            text="Emitir factura",
+            bootstyle="success",
+            padding=(36, 14),
+            command=self.emitir,
+        )
+        self.boton_emitir.pack(side="right", anchor="s")
+
+    # ------------------------------------------------------------- Estado
+
+    def _estado(self, texto, tipo="secondary"):
+        self.estado.configure(text=texto, bootstyle=tipo)
+
+    def _error(self, texto, campo=None):
+        self._estado(texto, "danger")
+        self.root.bell()
+        if campo is not None:
+            campo.focus_set()
+
+    def _bloquear(self, ocupado):
+        self.ocupado = ocupado
+        estado = "disabled" if ocupado else "normal"
+        for boton in (self.boton_emitir, self.boton_quitar, self.boton_vaciar):
+            boton.configure(state=estado)
+        self.boton_emitir.configure(
+            text="Emitiendo…" if ocupado else "Emitir factura"
+        )
+        if ocupado:
+            self.progreso.configure(value=0)
+            self.progreso.pack(side="right")
         else:
-            try:
-                q = float(self.quantity.get())
-                p = float(self.priceu.get())
-                total_price = q * p
-                self.tree.insert(
-                    "",
-                    "end",
-                    values=(
-                        self.name.get(),
-                        self.quantity.get(),
-                        self.priceu.get(),
-                        total_price,
-                    ),
-                )
+            self.progreso.pack_forget()
 
-                self.name.delete(0, "end")
-                self.quantity.delete(0, "end")
-                self.priceu.delete(0, "end")
-                self.error_label.config(text="")
-                self.actualizar_label()
-            except ValueError:
-                self.error_label.config(
-                    text="La Cantidad o el Precio Unitario no es un numero"
-                )
+    # ------------------------------------------------------------ Cliente
 
-    def delete_rows(self):
-        """
-        Elimina los productos seleccionados de la tabla de productos.
-        """
-        for selected_item in self.tree.selection():
-            self.tree.delete(selected_item)
+    def _al_cambiar_condicion(self, _evento=None):
+        tipos = TIPOS_POR_CONDICION[self.condicion.get()]
+        self.tipo_documento.configure(values=tipos)
+        if self.tipo_documento.get() not in tipos:
+            self.tipo_documento.set(tipos[0])
+        obligatorio = self.condicion.get() != CONDICIONES_IVA[0]
+        self.ayuda_documento.configure(
+            text="Obligatorio para esta condición."
+            if obligatorio
+            else "Opcional para consumidor final."
+        )
+        self._formatear_documento()
 
-    def delete_all_rows(self):
-        """
-        Elimina todos los productos de la tabla de productos.
-        """
-        for item in self.tree.get_children():
-            self.tree.delete(item)
+    def _formatear_documento(self, *_args):
+        # Se difiere: cambiar la variable dentro de su propio trace deja al
+        # Entry mostrando el valor viejo.
+        if not self._formateando:
+            self._formateando = True
+            self.root.after_idle(self._aplicar_formato)
 
-    def get_client_id_option(self):
-        """
-        Obtiene el índice de la opción del identificador del cliente.
+    def _aplicar_formato(self):
+        digitos = solo_digitos(self.documento_var.get())
+        if self.tipo_documento.get() == "DNI":
+            texto = digitos[:8]
+        else:
+            texto = formatear_cuit(digitos)
+        if texto != self.documento_var.get():
+            self.documento_var.set(texto)
+            self.documento.icursor("end")
+        self._formateando = False
 
-        Returns:
-            int: El índice de la opción del identificador del cliente.
-        """
-        client_var = self.client_var.get()
+    def _validar_cliente(self):
+        """Devuelve (tipo, número) o None si hay un error (ya informado)."""
+        tipo = self.tipo_documento.get()
+        numero = solo_digitos(self.documento_var.get())
+        obligatorio = self.condicion.get() != CONDICIONES_IVA[0]
 
-        if client_var == "CUIT":
-            return 0
+        if not numero:
+            if obligatorio:
+                self._error("Ingresá el CUIT del cliente.", self.documento)
+                return None
+            return tipo, ""
+        if tipo == "DNI":
+            if len(numero) not in (7, 8):
+                self._error("El DNI debe tener 7 u 8 dígitos.", self.documento)
+                return None
+        elif not cuit_valido(numero):
+            self._error(f"El {tipo} del cliente no es válido.", self.documento)
+            return None
+        return tipo, numero
 
-        if client_var == "CUIL":
-            return 1
+    # ---------------------------------------------------------- Productos
 
-        if client_var == "DNI":
-            return 6
-
-        return -1
-
-    def get_selected_option(self):
-        """
-        Obtiene el índice de la condición frente al IVA seleccionada.
-
-        Returns:
-            int: El índice de la condición frente al IVA seleccionada.
-        """
-        option_var = self.option_var.get()
-        if option_var == CONDITION_OPTIONS[0]:
-            return 3
-
-        if option_var == CONDITION_OPTIONS[1]:
-            return 1
-
-        if option_var == CONDITION_OPTIONS[2]:
-            return 2
-
-        return -1
-
-    def get_products(self):
-        """
-        Obtiene la lista de productos de la tabla de productos.
-
-        Returns:
-            list: La lista de productos.
-        """
-
-        if self.tree.get_children() != ():
-            products = []
-            for item in self.tree.get_children():
-                item_data = self.tree.item(item, "values")
-
-                filtered_products = [
-                    [
-                        value
-                        for index, value in enumerate(item_data)
-                        if self.tree["columns"][index] not in "total_price"
-                    ]
-                ]
-
-                for item in filtered_products:
-                    products.append(
-                        {"Product": item[0], "Quantity": item[1], "Price": item[2]}
-                    )
-            return products
-
-        self.error_label.config(text="Error: No hay productos")
-        return None
-
-    def validate_client_id(self) -> int | str:
-        """
-        Valida el identificador del cliente.
-
-        Returns:
-            str: El identificador del cliente si es válido.
-            int: -1 si el identificador del cliente no es válido.
-        """
-        format_error = "El id del cliente (CUIT, CUIL o DNI) no es valido."
-
-        client_id = self.raw_client_id
-        client_type_var = self.client_var.get()
-
-        if client_id == "":
-            return client_id
-
-        valid_lengths = {"CUIT": [10, 11], "CUIL": [10, 11], "DNI": [7, 8]}
-
-        if client_type_var not in valid_lengths:
-            return -1
-
-        if len(client_id) not in valid_lengths[client_type_var]:
-            self.error_label.config(text=format_error)
-            return -1
-
+    def agregar_producto(self):
+        """Agrega a la tabla el producto cargado en el formulario."""
+        descripcion = self.descripcion.get().strip()
+        if not descripcion:
+            self._error("Escribí la descripción del producto.", self.descripcion)
+            return
         try:
-            int(client_id)
-            return client_id
+            cantidad = parsear_numero(self.cantidad.get())
+            if cantidad <= 0:
+                raise ValueError
         except ValueError:
-            self.error_label.config(text=format_error)
-            return -1
+            self._error("La cantidad debe ser un número mayor a cero.", self.cantidad)
+            return
+        try:
+            precio = parsear_numero(self.precio.get())
+            if precio <= 0:
+                raise ValueError
+        except ValueError:
+            self._error("El precio debe ser un número mayor a cero.", self.precio)
+            return
 
-    def clear_all(self):
-        """
-        Limpia todos los campos de entrada y la tabla de productos.
-        """
-        self.delete_all_rows()
-        self.raw_client_id = ""
-        self.client_entry.delete(0, "end")
-        self.name.delete(0, "end")
-        self.quantity.delete(0, "end")
-        self.priceu.delete(0, "end")
-        self.error_label.config(text="")
-        self.text_total.config(text="Total: 0$")
+        iid = self.tabla.insert(
+            "",
+            "end",
+            values=(
+                descripcion,
+                numero_a_texto(cantidad),
+                formatear_pesos(precio),
+                formatear_pesos(cantidad * precio),
+            ),
+        )
+        self.items[iid] = (descripcion, cantidad, precio)
+        self.tabla.see(iid)
 
-    def send(self):
-        """
-        Envía los datos de facturación a la página de ARCA y guarda la factura en la
-        base de datos.
-        """
-        client_id = self.validate_client_id()
-        client_option = self.get_client_id_option()
-        option = self.get_selected_option()
-        products = self.get_products()
-        totalvalue = 0
+        self.descripcion.set("")
+        self.cantidad.delete(0, "end")
+        self.cantidad.insert(0, "1")
+        self.precio.delete(0, "end")
+        self.descripcion.focus_set()
+        self._estado("Producto agregado.")
+        self._actualizar_total()
 
-        if products:
-            for product in products:
-                price = float(product["Price"])
-                quantity = float(product["Quantity"])
-                totalvalue += price * quantity
+    def quitar_seleccionados(self):
+        """Quita de la factura las filas seleccionadas."""
+        if self.ocupado:
+            return
+        seleccion = self.tabla.selection()
+        if not seleccion:
+            self._estado("Seleccioná una fila de la tabla para quitarla.")
+            return
+        for iid in seleccion:
+            self.tabla.delete(iid)
+            self.items.pop(iid, None)
+        self._actualizar_total()
 
-        factura = Facturas(
-            id_cliente=client_id,
-            tipo_de_documento_id=client_option + 1,
-            condicion_iva=option,
-            productos=products,
-            valor_total=totalvalue,
+    def vaciar(self):
+        """Quita todos los productos de la factura."""
+        self.tabla.delete(*self.tabla.get_children())
+        self.items.clear()
+        self._actualizar_total()
+
+    def _total(self):
+        return sum(cantidad * precio for _, cantidad, precio in self.items.values())
+
+    def _actualizar_total(self):
+        self.total.configure(text=formatear_pesos(self._total()))
+        cantidad = len(self.items)
+        self.contador.configure(
+            text="" if not cantidad else f"{cantidad} ítem{'s' if cantidad > 1 else ''}"
         )
 
-        if client_option != -1 and option != -1 and client_id != -1 and products:
+    def _limpiar(self):
+        self.vaciar()
+        self.documento_var.set("")
+        self.condicion.set(CONDICIONES_IVA[0])
+        self._al_cambiar_condicion()
 
-            thread = threading.Thread(
-                target=realizar_operacion,
-                args=(client_option, client_id, option, products),
+    # ------------------------------------------------------------ Diálogos
+
+    def abrir_configuracion(self):
+        """Abre la configuración de la cuenta."""
+        if self.ocupado:
+            return
+        dialogo = SettingsDialog(self.root)
+        self.root.wait_window(dialogo)
+        if dialogo.guardado:
+            self._estado("Configuración guardada.", "success")
+
+    def abrir_historial(self):
+        """Abre el historial de facturas emitidas."""
+        self.root.wait_window(HistoryDialog(self.root))
+
+    # ------------------------------------------------------------- Emisión
+
+    def emitir(self):
+        """Valida los datos y emite la factura en segundo plano."""
+        if self.ocupado:
+            return
+        cliente = self._validar_cliente()
+        if cliente is None:
+            return
+        if not self.items:
+            self._error("Agregá al menos un producto a la factura.", self.descripcion)
+            return
+        if not is_configured():
+            self._error("Falta completar la configuración de ARCA.")
+            self.abrir_configuracion()
+            return
+
+        tipo, numero = cliente
+        condicion = self.condicion.get()
+        total = self._total()
+        destinatario = f"{tipo} {self.documento_var.get()}" if numero else "sin identificar"
+        simulacion = "\n\n(Modo DEBUG: no se confirmará en ARCA.)" if is_debug() else ""
+        if not messagebox.askokcancel(
+            "Emitir factura",
+            f"Se va a emitir una factura por {formatear_pesos(total)}\n"
+            f"{descripcion_comprobante(condicion)}\n"
+            f"{condicion} · Cliente {destinatario}\n"
+            f"{len(self.items)} ítem(s)\n\n"
+            "Una vez emitida no se puede deshacer. ¿Continuar?" + simulacion,
+            parent=self.root,
+        ):
+            return
+
+        productos = [
+            {
+                "Product": descripcion,
+                "Quantity": numero_a_texto(cantidad),
+                "Price": numero_a_texto(precio),
+            }
+            for descripcion, cantidad, precio in self.items.values()
+        ]
+        datos = {
+            "tipo": tipo,
+            "numero": numero,
+            "condicion": condicion,
+            "productos": productos,
+            "total": total,
+        }
+
+        self._bloquear(True)
+        self._estado("Conectando con ARCA…")
+        threading.Thread(target=self._trabajar, args=(datos,), daemon=True).start()
+        self.root.after(100, self._atender_eventos, datos)
+
+    def _trabajar(self, datos):
+        """Hilo de trabajo: nunca toca widgets, solo publica eventos."""
+        try:
+            resultado = emitir_factura(
+                datos["tipo"],
+                datos["numero"],
+                datos["condicion"],
+                datos["productos"],
+                on_progress=lambda p, m: self.eventos.put(("progreso", (p, m))),
             )
-            thread.start()
+            self.eventos.put(("fin", resultado))
+        except FacturacionError as error:
+            self.eventos.put(("error", str(error)))
+        except Exception as error:  # pylint: disable=broad-except
+            logger.exception("Error inesperado al emitir")
+            self.eventos.put(("error", f"Error inesperado: {error}"))
 
-            session.add(factura)
-            session.commit()
-            session.close()
+    def _atender_eventos(self, datos):
+        try:
+            while True:
+                tipo, valor = self.eventos.get_nowait()
+                if tipo == "progreso":
+                    self.progreso.configure(value=valor[0])
+                    self._estado(f"{valor[1]}…")
+                elif tipo == "fin":
+                    self._al_terminar(datos, valor)
+                    return
+                else:
+                    self._bloquear(False)
+                    self._estado("No se pudo emitir la factura.", "danger")
+                    messagebox.showerror(
+                        "No se pudo emitir", valor, parent=self.root
+                    )
+                    return
+        except queue.Empty:
+            pass
+        self.root.after(100, self._atender_eventos, datos)
 
-            self.clear_all()
+    def _al_terminar(self, datos, resultado):
+        self._bloquear(False)
+        if not resultado["emitida"]:
+            self._estado("Simulación terminada: la factura no se confirmó.", "info")
+            return
+
+        try:
+            guardar_factura(
+                datos["numero"],
+                datos["tipo"],
+                datos["condicion"],
+                datos["productos"],
+                datos["total"],
+            )
+        except Exception:  # pylint: disable=broad-except
+            logger.exception("La factura se emitió pero no se guardó en el historial")
+
+        self._limpiar()
+        pdf = resultado["pdf"]
+        detalle = resultado.get("detalle")
+        encabezado = f"{detalle}\n\n" if detalle else ""
+        if pdf:
+            self._estado(f"Factura emitida · {detalle or pdf.name}", "success")
+            if messagebox.askyesno(
+                "Factura emitida",
+                f"{encabezado}La factura se emitió y se guardó en:\n{pdf}\n\n"
+                "¿Abrir el PDF?",
+                parent=self.root,
+            ):
+                os.startfile(pdf)  # pylint: disable=no-member
+        else:
+            self._estado(f"Factura emitida sin PDF. {detalle or ''}", "warning")
+            messagebox.showwarning(
+                "Factura emitida",
+                f"{encabezado}La factura se emitió, pero no se pudo guardar el PDF.\n"
+                + (
+                    "Los datos quedaron registrados en logs/app.log."
+                    if motor() == "api"
+                    else "Podés descargarlo desde «Consultas» en Comprobantes en línea."
+                ),
+                parent=self.root,
+            )
